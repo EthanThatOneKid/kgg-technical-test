@@ -11,9 +11,6 @@ Handles any question where:
 import urllib.request
 import urllib.parse
 import json
-import time
-import re
-import sys
 
 from textblob import TextBlob
 import argparse
@@ -25,18 +22,10 @@ SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
 _entity_cache: dict[str, str] = {}
 _property_cache: dict[str, str] = {}
 
-_QUESTION_PATTERNS = [
-    # (regex_pattern, property_hint_for_fallback_or_override, entity_extractor)
-    # Priority-ordered list of common question patterns
-    (r"how\s+old\s+is\s+(.+)", "date of birth", None),
-    (r"what\s+age\s+is\s+(.+)", "date of birth", None),
-    (r"when\s+did\s+(.+?)\s+die", "date of death", None),
-    (r"what\s+is\s+the\s+population\s+of\s+(.+)", "population", None),
-    (r"who\s+is\s+the\s+spouse\s+of\s+(.+)", "spouse", None),
-    (r"who\s+is\s+(.+)\s+spouse", "spouse", None),
-    (r"what\s+is\s+the\s+capital\s+of\s+(.+)", "capital", None),
-    (r"when\s+was\s+(.+)\s+born", "date of birth", None),
-]
+_SKIP_WORDS = frozenset({
+    "who", "what", "when", "where", "which", "how", "much", "many",
+    "is", "was", "are", "were", "did", "do", "does", "the", "a", "an",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -71,16 +60,30 @@ def ask(question: str, endpoint: str = SPARQL_ENDPOINT) -> str:
     if property_hint == "population" and entity_id == "Q1384":
         entity_id = resolve_entity("New York City", endpoint)
 
+    # Remap canonical property hints to their Wikidata search terms
+    _PROPERTY_REMAP: dict[str, str] = {
+        "age": "date of birth",
+        "date of die": "date of death",
+    }
+    search_term = _PROPERTY_REMAP.get(property_hint, property_hint)
+
     # 3. Resolve property hint → Wikidata P-id (if not already cached)
-    if property_hint not in _property_cache:
-        _property_cache[property_hint] = search_property(property_hint)
-    property_id = _property_cache[property_hint]
+    if search_term not in _property_cache:
+        _property_cache[search_term] = search_property(search_term)
+    property_id = _property_cache[search_term]
     if property_id is None:
         raise ValueError(f"No Wikidata property found for: {property_hint}")
 
     # 4. Build and execute SPARQL query
     query = build_query(entity_id, property_id)
-    return execute_query(query, endpoint)
+    try:
+        return execute_query(query, endpoint)
+    except ValueError:
+        if property_hint == "age":
+            # Retry with hardcoded P569 if the initial query failed
+            query = build_query(entity_id, "P569")
+            return execute_query(query, endpoint)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -90,47 +93,95 @@ def ask(question: str, endpoint: str = SPARQL_ENDPOINT) -> str:
 
 def parse_question(question: str) -> tuple[str, str]:
     """
-    Split a question into (entity, property_hint).
-
-    Tries regex question-patterns first, then falls back to TextBlob POS tagging.
-
-    Examples:
-      "how old is Tom Cruise"      → entity="Tom Cruise",       hint="date of birth"
-      "what age is Madonna?"       → entity="Madonna",           hint="date of birth"
-      "what is the population of London" → entity="London",      hint="population"
-      "when did Shakespeare die"   → entity="Shakespeare",      hint="date of death"
-      "what is the capital of France" → entity="France",         hint="capital"
+    Extract (entity_mention, property_hint) from a natural language question
+    using TextBlob POS tagging only — no regex.
     """
-    q = question.strip().rstrip("?")
-    entity_mention = None
-    property_hint = None
+    blob = TextBlob(question.strip().rstrip("?"))
+    tags = blob.tags
 
-    for pattern, hint, _ in _QUESTION_PATTERNS:
-        m = re.search(pattern, q, re.IGNORECASE)
-        if m:
-            entity_mention = m.group(1).strip()
-            property_hint = hint
+    # Detect the entity as the longest consecutive run of NNP (proper nouns)
+    # — this is more robust than TextBlob's noun-phrase extraction which
+    # often drops the first word of a two-word entity like "New York".
+    entity_phrase = None
+    best_len = 0
+    i = 0
+    while i < len(tags):
+        if tags[i][1] in {"NNP", "NNPS"}:
+            j = i
+            while j < len(tags) and tags[j][1] in {"NNP", "NNPS"}:
+                j += 1
+            run_len = j - i
+            if run_len > best_len:
+                best_len = run_len
+                entity_phrase = " ".join(tags[k][0] for k in range(i, j))
+            i = j
+        else:
+            i += 1
+
+    # Collect entity words as a set for filtering
+    entity_words: set[str] = {}
+    if entity_phrase:
+        entity_words = set(entity_phrase.lower().split())
+
+    # If a WRB (wh-adverb: how, when, where, why) is present, the word
+    # immediately after it is the property descriptor — this catches
+    # "how old", "when did X die", etc. where the property word is JJ/VB.
+    property_hint = None
+    wrb_idx = None
+    for i, (word, pos) in enumerate(tags):
+        if pos == "WRB":
+            wrb_idx = i
             break
 
-    # Fallback: TextBlob noun-phrase + POS-based property extraction
-    if entity_mention is None:
-        blob = TextBlob(q)
-        noun_phrases = list(blob.noun_phrases)
-        entity_mention = noun_phrases[0] if noun_phrases else q
+    if wrb_idx is not None and wrb_idx + 1 < len(tags):
+        # Word right after WRB
+        next_word, next_pos = tags[wrb_idx + 1]
+        next_word_lower = next_word.lower()
 
-        # Collect NN/NNP words outside the entity mention
-        entity_words = set(entity_mention.lower().split())
+        if wrb_idx == 0 and next_pos == "JJ":
+            # "how old", "how tall", "how big" → canonical property is "age"
+            property_hint = "age"
+        elif next_word_lower == "did" and wrb_idx + 2 < len(tags):
+            # "when did X die" → next word after "did" is the verb
+            verb_word = tags[wrb_idx + 2][0].lower()
+            # Skip the verb if it is the entity itself (single-word entity adjacent to "did")
+            if verb_word in entity_words:
+                property_hint = None
+            elif verb_word not in _SKIP_WORDS:
+                property_hint = f"date of {verb_word}"
+        elif next_word_lower not in _SKIP_WORDS:
+            property_hint = next_word_lower
+
+    # Collect entity word positions as a set of (lower_word, index) tuples.
+    # Only skip words from the hint if they are AT THE ENTITY PHRASE POSITION.
+    entity_word_positions: set[tuple[str, int]] = set()
+    if entity_phrase:
+        ep_words = entity_phrase.lower().split()
+        ep_len = len(ep_words)
+        for i, (word, _) in enumerate(tags):
+            if tuple(tags[k][0].lower() for k in range(i, i + ep_len)) == tuple(ep_words):
+                for j in range(ep_len):
+                    entity_word_positions.add((tags[i + j][0].lower(), i + j))
+                break
+
+    # Fallback: collect NN/NNP/NNS words that aren't part of the entity
+    if not property_hint:
         hint_words = [
-            word.lower()
-            for word, tag in blob.tags
-            if tag in ("NN", "NNP", "NNS", "JJ") and word.lower() not in entity_words
+            word for i, (word, pos) in enumerate(tags)
+            if pos in {"NN", "NNP", "NNS"}
+            and (word.lower(), i) not in entity_word_positions
         ]
-        # Strip question framing
-        skip = {"what", "who", "when", "where", "which", "how", "much", "many", "is", "was", "did", "do", "does"}
-        hint_words = [w for w in hint_words if w not in skip]
-        property_hint = " ".join(hint_words) if hint_words else "unknown"
+        property_hint = " ".join(hint_words) if hint_words else None
 
-    return entity_mention, property_hint
+    # Entity fallback: remaining non-skip words
+    if not entity_phrase:
+        remaining = [
+            word for word, pos in tags
+            if word.lower() not in _SKIP_WORDS
+        ]
+        entity_phrase = " ".join(remaining) if remaining else question.strip()
+
+    return entity_phrase, (property_hint if property_hint else "unknown")
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +255,7 @@ def resolve_qid_to_label(qid: str) -> str | None:
 
 
 # Alias for backward compatibility — accepts but ignores endpoint arg
-def resolve_entity(entity_name: str, _endpoint: str = None) -> str | None:
+def resolve_entity(entity_name: str, endpoint: str = None) -> str | None:
     return search_wikidata(entity_name)
 
 
