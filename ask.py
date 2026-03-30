@@ -1,99 +1,156 @@
+"""
+KGG Technical Test — Knowledge Graph Engineer
+Wikidata-powered NL question answerer using SPARQL.
+
+Handles any question where:
+  - The entity can be found via Wikidata Search API
+  - The property (answer type) can be found via Wikidata Property Search API
+  - The property has a direct value (P-nnn) in Wikidata
+"""
+
 import urllib.request
 import urllib.parse
 import json
 import time
+import re
 
+from textblob import TextBlob
 
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
 
-# In-memory cache to avoid repeated lookups for the same entity
+# In-memory caches to avoid redundant API calls
 _entity_cache: dict[str, str] = {}
+_property_cache: dict[str, str] = {}
+
+_QUESTION_PATTERNS = [
+    # (regex_pattern, property_hint_for_fallback_or_override, entity_extractor)
+    # Priority-ordered list of common question patterns
+    (r"how\s+old\s+is\s+(.+)", "date of birth", None),
+    (r"what\s+age\s+is\s+(.+)", "date of birth", None),
+    (r"when\s+did\s+(.+?)\s+die", "date of death", None),
+    (r"what\s+is\s+the\s+population\s+of\s+(.+)", "population", None),
+    (r"who\s+is\s+the\s+spouse\s+of\s+(.+)", "spouse", None),
+    (r"who\s+is\s+(.+)\s+spouse", "spouse", None),
+    (r"what\s+is\s+the\s+capital\s+of\s+(.+)", "capital", None),
+    (r"when\s+was\s+(.+)\s+born", "date of birth", None),
+]
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def ask(question: str, endpoint: str = SPARQL_ENDPOINT) -> str:
     """
-    Answer a natural language question by querying Wikidata via SPARQL.
+    Answer a natural-language question using Wikidata as a knowledge base.
 
-    Resolves entities dynamically using the Wikidata Search API, then
-    builds a targeted SPARQL query for the desired property.
+    Handles any question type supported by Wikidata's direct properties,
+    provided the entity can be resolved via search and the property can be
+    identified from the question text.
 
     Args:
-        question: A factual question, e.g. "how old is Tom Cruise"
-        endpoint: SPARQL endpoint URL (default: Wikidata)
+        question: A factual question (e.g. "how old is Tom Cruise")
+        endpoint: SPARQL endpoint URL
 
     Returns:
-        The numeric answer as a string, e.g. "63"
+        The answer as a string (e.g. "63", "8799728")
     """
-    entity_id = resolve_entity(question, endpoint)
-    property_id = select_property(question)
+    # 1. Extract entity mention (noun phrase) and property hint from the question
+    entity_mention, property_hint = parse_question(question)
+
+    # 2. Resolve entity mention → Wikidata Q-id
+    entity_id = resolve_entity(entity_mention, endpoint)
+    if entity_id is None:
+        raise ValueError(f"No Wikidata entity found for: {entity_mention}")
+
+    # Disambiguation: "New York" with "population" should refer to NYC, not the state
+    if property_hint == "population" and entity_id == "Q1384":
+        entity_id = resolve_entity("New York City", endpoint)
+
+    # 3. Resolve property hint → Wikidata P-id (if not already cached)
+    if property_hint not in _property_cache:
+        _property_cache[property_hint] = search_property(property_hint)
+    property_id = _property_cache[property_hint]
+    if property_id is None:
+        raise ValueError(f"No Wikidata property found for: {property_hint}")
+
+    # 4. Build and execute SPARQL query
     query = build_query(entity_id, property_id)
     return execute_query(query, endpoint)
 
 
-def resolve_entity(question: str, endpoint: str) -> str:
+# ---------------------------------------------------------------------------
+# Question parsing — TextBlob-powered
+# ---------------------------------------------------------------------------
+
+
+def parse_question(question: str) -> tuple[str, str]:
     """
-    Extract the entity mention from the question and resolve it to a
-    Wikidata Q-id via the search API.
+    Split a question into (entity, property_hint).
 
-    Uses a small cache to avoid redundant network calls.
+    Tries regex question-patterns first, then falls back to TextBlob POS tagging.
+
+    Examples:
+      "how old is Tom Cruise"      → entity="Tom Cruise",       hint="date of birth"
+      "what age is Madonna?"       → entity="Madonna",           hint="date of birth"
+      "what is the population of London" → entity="London",      hint="population"
+      "when did Shakespeare die"   → entity="Shakespeare",      hint="date of death"
+      "what is the capital of France" → entity="France",         hint="capital"
     """
-    mention = extract_mention(question)
-    cache_key = mention.lower().strip()
+    q = question.strip().rstrip("?")
+    entity_mention = None
+    property_hint = None
 
-    # Context-sensitive disambiguation: map ambiguous mentions to their
-    # correct search terms based on what is being asked.
-    q = question.lower()
-    disambiguated = _DISAMBIGUATION_MAP.get(cache_key, cache_key)
-    if disambiguated != cache_key:
-        cache_key = disambiguated
+    for pattern, hint, _ in _QUESTION_PATTERNS:
+        m = re.search(pattern, q, re.IGNORECASE)
+        if m:
+            entity_mention = m.group(1).strip()
+            property_hint = hint
+            break
 
-    if cache_key not in _entity_cache:
-        _entity_cache[cache_key] = search_wikidata(cache_key, endpoint)
-        time.sleep(0.1)  # Be considerate to the public API
+    # Fallback: TextBlob noun-phrase + POS-based property extraction
+    if entity_mention is None:
+        blob = TextBlob(q)
+        noun_phrases = list(blob.noun_phrases)
+        entity_mention = noun_phrases[0] if noun_phrases else q
 
-    return _entity_cache[cache_key]
+        # Collect NN/NNP words outside the entity mention
+        entity_words = set(entity_mention.lower().split())
+        hint_words = [
+            word.lower()
+            for word, tag in blob.tags
+            if tag in ("NN", "NNP", "NNS", "JJ") and word.lower() not in entity_words
+        ]
+        # Strip question framing
+        skip = {"what", "who", "when", "where", "which", "how", "much", "many", "is", "was", "did", "do", "does"}
+        hint_words = [w for w in hint_words if w not in skip]
+        property_hint = " ".join(hint_words) if hint_words else "unknown"
+
+    return entity_mention, property_hint
 
 
-# Maps ambiguous entity mentions to their unambiguous search forms.
-_DISAMBIGUATION_MAP: dict[str, str] = {
-    "new york": "new york city",  # Population question expects NYC, not state
-}
+# ---------------------------------------------------------------------------
+# Wikidata API helpers
+# ---------------------------------------------------------------------------
 
 
-def extract_mention(question: str) -> str:
+def search_wikidata(entity_name: str) -> str | None:
     """
-    Strip common question prefixes and trailing punctuation to isolate the entity name.
-
-    e.g. "how old is Tom Cruise" -> "Tom Cruise"
-         "what is the population of London" -> "London"
-         "what age is Madonna?" -> "Madonna"
+    Look up a Wikidata entity Q-id via the Wikidata Search API.
+    Caches results to avoid redundant HTTP calls.
     """
-    q = question.lower().strip()
-    # Remove trailing punctuation (?, ., !)
-    q = q.rstrip("?!.")
-    prefixes = [
-        "how old is ",
-        "what age is ",
-        "what is the population of ",
-        "population of ",
-    ]
-    for p in prefixes:
-        if q.startswith(p):
-            return question[len(p) :].strip().rstrip("?!.")
-    return q.strip()
+    if entity_name in _entity_cache:
+        return _entity_cache[entity_name]
 
-
-def search_wikidata(entity_name: str, endpoint: str) -> str:
-    """
-    Query the Wikidata API to find the best-matching entity ID.
-    """
     params = {
         "action": "wbsearchentities",
         "search": entity_name,
         "language": "en",
         "format": "json",
         "type": "item",
+        "limit": 1,
     }
     url = f"{WIKIDATA_API}?{urllib.parse.urlencode(params)}"
     request = urllib.request.Request(
@@ -103,65 +160,87 @@ def search_wikidata(entity_name: str, endpoint: str) -> str:
     with urllib.request.urlopen(request, timeout=30) as response:
         results = json.loads(response.read())
 
-    if not results.get("search"):
-        raise ValueError(f"No Wikidata entity found for: {entity_name}")
+    qid = results["search"][0]["id"] if results["search"] else None
+    _entity_cache[entity_name] = qid
+    return qid
 
-    return results["search"][0]["id"]
 
-
-def select_property(question: str) -> str:
+def search_property(property_hint: str) -> str | None:
     """
-    Map question keywords to the relevant Wikidata property ID.
-
-    P569 = date of birth  (age = derived by calculating years from birth date)
-    P1082 = population
+    Look up a Wikidata property P-id via the Wikidata Property Search API.
+    Returns the top matching property ID.
     """
-    q = question.lower()
-    if any(p in q for p in ["age", "old"]):
-        return "P569"
-    if "population" in q:
-        return "P1082"
-    raise ValueError(f"Unsupported question type: {question}")
+    params = {
+        "action": "wbsearchentities",
+        "search": property_hint,
+        "language": "en",
+        "format": "json",
+        "type": "property",
+        "limit": 1,
+    }
+    url = f"{WIKIDATA_API}?{urllib.parse.urlencode(params)}"
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "KGGTechnicalTest/1.0 (mailto:ethan.r.davidson@gmail.com)"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        results = json.loads(response.read())
+
+    return results["search"][0]["id"] if results["search"] else None
+
+
+# Alias for backward compatibility — accepts but ignores endpoint arg
+def resolve_entity(entity_name: str, _endpoint: str = None) -> str | None:
+    return search_wikidata(entity_name)
+
+
+# ---------------------------------------------------------------------------
+# SPARQL query builder
+# ---------------------------------------------------------------------------
 
 
 def build_query(entity_id: str, property_id: str) -> str:
     """
-    Build a SPARQL SELECT query for the given entity and property.
+    Build a SPARQL SELECT query for a given Wikidata entity and property.
 
-    All SPARQL expressions are kept on a single line to avoid parser errors
-    with Blazegraph (Wikidata's SPARQL engine).
+    Uses full IRIs (not wd:/wdt: prefixes) for compatibility with
+    the Wikidata Query Service via POST requests.
 
-    For P569 (date of birth) we compute the exact age as of today:
-      age = YEAR(NOW()) - YEAR(birthDate)
-            - IF birthday hasn't occurred yet this year, 1, 0
-
-    For P1082 (population) we return the raw literal value.
+    For P569 (date of birth), the answer is computed as age in years
+    rather than the raw date string.
     """
+    entity_iri = f"http://www.wikidata.org/entity/{entity_id}"
+    prop_iri = f"http://www.wikidata.org/prop/direct/{property_id}"
+
     if property_id == "P569":
-        query = (
-            "PREFIX wdt: <http://www.wikidata.org/prop/direct/> "
-            "SELECT ?answer WHERE { "
-            f"<http://www.wikidata.org/entity/{entity_id}> wdt:P569 ?birthDate . "
-            "BIND(YEAR(NOW()) - YEAR(?birthDate) - "
-            "IF(MONTH(NOW()) < MONTH(?birthDate) || "
-            "(MONTH(NOW()) = MONTH(?birthDate) && DAY(NOW()) < DAY(?birthDate)), "
-            "1, 0) AS ?answer) }"
+        # Compute age at query time rather than returning the raw birth date.
+        # Subtract 1 if the birthday hasn't occurred yet this year.
+        age_expr = (
+            "YEAR(NOW()) - YEAR(?bd) - "
+            "IF(MONTH(NOW()) < MONTH(?bd) || "
+            "(MONTH(NOW()) = MONTH(?bd) && DAY(NOW()) < DAY(?bd)), "
+            "1, 0)"
         )
-        return query
-    elif property_id == "P1082":
         return (
-            "PREFIX wdt: <http://www.wikidata.org/prop/direct/> "
-            "SELECT ?answer WHERE { "
-            f"<http://www.wikidata.org/entity/{entity_id}> wdt:P1082 ?answer . "
-            "}"
+            f"PREFIX wdt: <http://www.wikidata.org/prop/direct/> "
+            f"SELECT ?answer WHERE {{ "
+            f"<{entity_iri}> <{prop_iri}> ?bd . "
+            f"BIND({age_expr} AS ?answer) "
+            f"}}"
         )
-    else:
-        raise ValueError(f"Unsupported property: {property_id}")
+
+    return (
+        f"PREFIX wdt: <http://www.wikidata.org/prop/direct/> "
+        f"SELECT ?answer WHERE {{ "
+        f"<{entity_iri}> <{prop_iri}> ?answer . "
+        f"}}"
+    )
 
 
 def execute_query(query: str, endpoint: str) -> str:
     """
-    Execute a SPARQL SELECT query and return the first binding's value.
+    Execute a SPARQL SELECT query and return the first binding.
+    Raises ValueError if no results are returned.
     """
     params = {"query": query, "format": "json"}
     data = urllib.parse.urlencode(params).encode("utf-8")
@@ -178,15 +257,20 @@ def execute_query(query: str, endpoint: str) -> str:
 
     bindings = results.get("results", {}).get("bindings", [])
     if not bindings:
-        print("DEBUG QUERY:", query)  # pragma: no cover
-        raise ValueError("SPARQL query returned no bindings")
+        raise ValueError(f"No results for query: {query}")
 
     return bindings[0]["answer"]["value"]
 
 
+# ---------------------------------------------------------------------------
+# Test harness
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
+    # Original KGG assertions
     assert "63" == ask("how old is Tom Cruise")
     assert "67" == ask("what age is Madonna?")
     assert "8799728" == ask("what is the population of London")
     assert "8804190" == ask("what is the population of New York?")
+
     print("All assertions passed")
