@@ -13,8 +13,10 @@ import urllib.parse
 import json
 import time
 import re
+import sys
 
 from textblob import TextBlob
+import argparse
 
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
@@ -189,6 +191,18 @@ def search_property(property_hint: str) -> str | None:
     return results["search"][0]["id"] if results["search"] else None
 
 
+def resolve_qid_to_label(qid: str) -> str | None:
+    """Fetch the English label for a Wikidata Q-id."""
+    url = f"{WIKIDATA_API}?action=wbgetentities&ids={qid}&props=labels&languages=en&format=json"
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "KGGTechnicalTest/1.0 (mailto:ethan.r.davidson@gmail.com)"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = json.loads(response.read())
+    return data.get("entities", {}).get(qid, {}).get("labels", {}).get("en", {}).get("value")
+
+
 # Alias for backward compatibility — accepts but ignores endpoint arg
 def resolve_entity(entity_name: str, _endpoint: str = None) -> str | None:
     return search_wikidata(entity_name)
@@ -259,7 +273,16 @@ def execute_query(query: str, endpoint: str) -> str:
     if not bindings:
         raise ValueError(f"No results for query: {query}")
 
-    return bindings[0]["answer"]["value"]
+    raw = bindings[0]["answer"]["value"]
+
+    # If the answer is a Wikidata entity Q-id, resolve it to a label
+    if raw.startswith("http://www.wikidata.org/entity/"):
+        qid = raw.split("/")[-1]
+        label = resolve_qid_to_label(qid)
+        if label:
+            return label
+
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -267,10 +290,23 @@ def execute_query(query: str, endpoint: str) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Original KGG assertions
-    assert "63" == ask("how old is Tom Cruise")
-    assert "67" == ask("what age is Madonna?")
-    assert "8799728" == ask("what is the population of London")
-    assert "8804190" == ask("what is the population of New York?")
+    import sys
 
-    print("All assertions passed")
+    if len(sys.argv) > 1:
+        # CLI mode: python ask.py "how old is Tom Cruise"
+        parser = argparse.ArgumentParser(description="Ask Wikidata a question.")
+        parser.add_argument("question", type=str, help="e.g. 'how old is Tom Cruise'")
+        parser.add_argument("--endpoint", default=SPARQL_ENDPOINT)
+        args = parser.parse_args()
+        try:
+            print(ask(args.question, args.endpoint))
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # Test mode: run the original KGG assertions
+        assert "63" == ask("how old is Tom Cruise")
+        assert "67" == ask("what age is Madonna?")
+        assert "8799728" == ask("what is the population of London")
+        assert "8804190" == ask("what is the population of New York?")
+        print("All assertions passed")
